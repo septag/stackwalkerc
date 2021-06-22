@@ -11,6 +11,7 @@
 - Reporting of loaded modules and symbol search paths of the executable
 - Callstack reporting of other threads and processes
 - Callstack reporting in system exceptions
+- Does not depend on DbgHelp.DLL to be included with the executable, this library dynamically loads the DbgHelp.dll from common system paths
 
 ## Usage
 This is a single header library, so all you need is include the file in your source and you are good to go:
