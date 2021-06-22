@@ -40,21 +40,7 @@ static void callstack_entry(const sw_callstack_entry* entry, void* userptr)
     printf("\t%s(%d): %s\n", entry->line_filename, entry->line, entry->und_fullname);
 }
 
-To build the example, just make sure you have the right compiler flags (build debug symbols) and also link with *Version.lib*. The main API will be loaded dyamically from *dbghelp.dll* in common system paths (see `sw__init_internal` to see the search paths for the DLL file):
-
-MSVC:
-```
-cd example
-cl /Od /Zi Version.lib example.cpp
-```
-
-Clang (win):
-```
-cd example 
-clang -g -O0 -lVersion example.cpp -o example.exe
-```
-
-int main() 
+int main(int argc, char* argv[]) 
 {
     sw_callbacks callbacks = {
         .callstack_entry = callstack_entry
@@ -70,9 +56,24 @@ int main()
 }
 ```
 
+To build the example, just make sure you have the right compiler flags (build debug symbols) and also link with *Version.lib*. The main API will be loaded dyamically from *dbghelp.dll* in common system paths (see `sw__init_internal` to see the search paths for the DLL file):
+
+MSVC:
+```
+cd example
+cl /Od /Zi Version.lib example.cpp
+```
+
+Clang (win):
+```
+cd example 
+clang -g -O0 -lVersion example.cpp -o example.exe
+```
+
+
 ## Acknowledgments
-Almost all of the Windows API usage for StackWalk are taken from [StackWalker](https://github.com/JochenKalmbach/StackWalker) project by Jochen Kalmbach. This is actually a much more simplified and straight-to-the-point version of *StackWalker* library.   
-This project only supports msvc2015+/clang(windows) compilers, if you prefer C++ API or want support for older Visual studio versions, check out Kalmbach's StackWalker library referenced above.
+Almost all of the Windows API usage for StackWalk are taken from [StackWalker](https://github.com/JochenKalmbach/StackWalker) project by *Jochen Kalmbach*. This is actually a much more simplified and straight-to-the-point version of *StackWalker* library.   
+This project only supports msvc2015+/clang(windows) compilers, if you prefer C++ API or want support for older Visual studio versions, check out Kalmbach's StackWalker library mentioned above.
 
 [License (BSD 2-clause)](https://github.com/septag/stackwalkerc/blob/master/LICENSE)
 --------------------------------------------------------------------------
@@ -83,7 +84,7 @@ This project only supports msvc2015+/clang(windows) compilers, if you prefer C++
 
 	Copyright 2021 Sepehr Taghdisian. All rights reserved.
 	
-	https://github.com/septag/rizz
+	https://github.com/septag/stackwalker.c
 	
 	Redistribution and use in source and binary forms, with or without
 	modification, are permitted provided that the following conditions are met:
