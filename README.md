@@ -73,7 +73,8 @@ clang -g -O0 -lVersion example.cpp -o example.exe
 
 
 ## Acknowledgments
-Almost all of the Windows API usage for StackWalk are taken from [StackWalker](https://github.com/JochenKalmbach/StackWalker) project by *Jochen Kalmbach*. This is actually a much more simplified and straight-to-the-point version of *StackWalker* library.   
+Almost all of the Windows API usage for StackWalk are taken from [StackWalker](https://github.com/JochenKalmbach/StackWalker) project by *Jochen Kalmbach*. For detailed information on how to use the API, read the *Kalmbach's* article on [CodeProject](https://www.codeproject.com/Articles/11132/Walking-the-callstack-2).  
+This is actually a much more simplified (and improved imo) and straight-to-the-point version of *StackWalker* library.   
 This project only supports msvc2015+/clang(windows) compilers, if you prefer C++ API or want support for older Visual studio versions, check out Kalmbach's StackWalker library mentioned above.
 
 [License (BSD 2-clause)](https://github.com/septag/stackwalkerc/blob/master/LICENSE)
