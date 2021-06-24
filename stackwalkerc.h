@@ -13,6 +13,7 @@
 // 
 // History:
 //      1.0.0: Initial version
+//      1.0.1: Bugs fixed, taking more sw_option flags into action
 //
 #pragma once
 
@@ -39,7 +40,7 @@ typedef enum sw_options
 {
     SW_OPTIONS_NONE          = 0,
     SW_OPTIONS_SYMBOL        = 0x1,     // Get symbol names
-    SW_OPTIONS_LINE          = 0x2,     // Get symbol lines
+    SW_OPTIONS_SOURCEPOS     = 0x2,     // Get symbol file+line
     SW_OPTIONS_MODULEINFO    = 0x4,     // Get module information
     SW_OPTIONS_FILEVERSION   = 0x8,     // Get file version for modules
     SW_OPTIONS_VERBOSE       = 0xf,     // All above options
@@ -371,11 +372,11 @@ _SW_PRIVATE DWORD sw__load_module(sw_context_internal* ctxi, HANDLE process, LPC
     if ((ctxi->parent->options & SW_OPTIONS_FILEVERSION) != 0) {
         VS_FIXEDFILEINFO* fInfo = NULL;
         DWORD dwHandle;
-        DWORD size = GetFileVersionInfoSizeA(img_name, &dwHandle);
-        if (size > 0) {
-            LPVOID data = SW_MALLOC(size);
+        DWORD ver_size = GetFileVersionInfoSizeA(img_name, &dwHandle);
+        if (ver_size > 0) {
+            LPVOID data = SW_MALLOC(ver_size);
             if (data != NULL) {
-                if (GetFileVersionInfoA(img_name, dwHandle, size, data) != 0) {
+                if (GetFileVersionInfoA(img_name, dwHandle, ver_size, data) != 0) {
                     UINT len;
                     char subblock[] = "\\";
                     if (VerQueryValueA(data, subblock, (LPVOID*)&fInfo, &len) == 0)
@@ -844,13 +845,15 @@ SW_API_IMPL sw_context* sw_create_context_catch(uint32_t options, sw_callbacks c
 
 SW_API_IMPL void sw_destroy_context(sw_context* ctx)
 {
-    if (ctx->internal.fSymCleanup)
-        ctx->internal.fSymCleanup(ctx->process);
-    if (ctx->internal.dbg_help)
-        FreeLibrary(ctx->internal.dbg_help);
+    if (ctx) {
+        if (ctx->internal.fSymCleanup)
+            ctx->internal.fSymCleanup(ctx->process);
+        if (ctx->internal.dbg_help)
+            FreeLibrary(ctx->internal.dbg_help);
 
-    memset(ctx, 0x0, sizeof(*ctx));
-    SW_FREE(ctx);
+        memset(ctx, 0x0, sizeof(*ctx));
+        SW_FREE(ctx);
+    }
 }
 
 SW_API_IMPL void sw_set_symbol_path(sw_context* ctx, const char* sympath)
@@ -957,7 +960,7 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
     IMAGEHLP_LINE64 line;
     int frame_num;
     bool first_entry_called = false;
-    int cur_recursion_count = 0;
+    uint32_t cur_recursion_count = 0;
 
     if (thread_hdl == NULL) {
         thread_hdl = GetCurrentThread();
@@ -1081,24 +1084,24 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
         if (s.AddrPC.Offset != 0) {
             // we seem to have a valid PC
             // show procedure info (SymGetSymFromAddr64())
-            if (ctx->internal.fSymGetSymFromAddr64(ctx->process, s.AddrPC.Offset,
-                                                   &(cs_entry.offset_from_symbol), symbol) != FALSE) {
+            if ((ctx->options & SW_OPTIONS_SYMBOL) && ctx->internal.fSymGetSymFromAddr64 != NULL) {
+                if (ctx->internal.fSymGetSymFromAddr64(ctx->process, s.AddrPC.Offset, &(cs_entry.offset_from_symbol), symbol) != FALSE) {
 
-                sw__strcpy(cs_entry.name, SW_MAX_NAME_LEN, symbol->Name);
-                ctx->internal.fUnDecorateSymbolName(symbol->Name, cs_entry.und_name, SW_MAX_NAME_LEN, UNDNAME_NAME_ONLY);
-                ctx->internal.fUnDecorateSymbolName(symbol->Name, cs_entry.und_fullname, SW_MAX_NAME_LEN, UNDNAME_COMPLETE);
-            } else {
-                DWORD gle = GetLastError();
-                if (gle == ERROR_INVALID_ADDRESS) {
-                    break;
-                }                                                       
-                 ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, s.AddrPC.Offset, ctx->callbacks_userptr);
+                    sw__strcpy(cs_entry.name, SW_MAX_NAME_LEN, symbol->Name);
+                    ctx->internal.fUnDecorateSymbolName(symbol->Name, cs_entry.und_name, SW_MAX_NAME_LEN, UNDNAME_NAME_ONLY);
+                    ctx->internal.fUnDecorateSymbolName(symbol->Name, cs_entry.und_fullname, SW_MAX_NAME_LEN, UNDNAME_COMPLETE);
+                } else {
+                    DWORD gle = GetLastError();
+                    if (gle == ERROR_INVALID_ADDRESS) {
+                        break;
+                    }                                                       
+                    ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, s.AddrPC.Offset, ctx->callbacks_userptr);
+                }
             }
 
             // show line number info, NT5.0-method (SymGetLineFromAddr64())
-            if (ctx->internal.fSymGetLineFromAddr64 != NULL) {    // yes, we have SymGetLineFromAddr64()
-                if (ctx->internal.fSymGetLineFromAddr64(ctx->process, s.AddrPC.Offset,
-                                                        (PDWORD)&(cs_entry.offset_from_line), &line) != FALSE) {
+            if ((ctx->options && SW_OPTIONS_SOURCEPOS) && ctx->internal.fSymGetLineFromAddr64 != NULL) {    // yes, we have SymGetLineFromAddr64()
+                if (ctx->internal.fSymGetLineFromAddr64(ctx->process, s.AddrPC.Offset, (PDWORD)&(cs_entry.offset_from_line), &line) != FALSE) {
                     cs_entry.line = line.LineNumber;
                     sw__strcpy(cs_entry.line_filename, SW_MAX_NAME_LEN, line.FileName);
                 } else {
@@ -1111,53 +1114,55 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
             }    // yes, we have SymGetLineFromAddr64()
 
             // show module info (SymGetModuleInfo64())
-            if (sw__get_module_info(&ctx->internal, ctx->process, s.AddrPC.Offset, &module)) {    // got module info OK
-                cs_entry.symbol_type = module.SymType;
-                switch (module.SymType) {
-                case SymNone:
-                    cs_entry.symbol_type_str = "-nosymbols-";
-                    break;
-                case SymCoff:
-                    cs_entry.symbol_type_str = "COFF";
-                    break;
-                case SymCv:
-                    cs_entry.symbol_type_str = "CV";
-                    break;
-                case SymPdb:
-                    cs_entry.symbol_type_str = "PDB";
-                    break;
-                case SymExport:
-                    cs_entry.symbol_type_str = "-exported-";
-                    break;
-                case SymDeferred:
-                    cs_entry.symbol_type_str = "-deferred-";
-                    break;
-                case SymSym:
-                    cs_entry.symbol_type_str = "SYM";
-                    break;
+            if (ctx->options && SW_OPTIONS_MODULEINFO) {
+                if (sw__get_module_info(&ctx->internal, ctx->process, s.AddrPC.Offset, &module)) {    // got module info OK
+                    cs_entry.symbol_type = module.SymType;
+                    switch (module.SymType) {
+                    case SymNone:
+                        cs_entry.symbol_type_str = "-nosymbols-";
+                        break;
+                    case SymCoff:
+                        cs_entry.symbol_type_str = "COFF";
+                        break;
+                    case SymCv:
+                        cs_entry.symbol_type_str = "CV";
+                        break;
+                    case SymPdb:
+                        cs_entry.symbol_type_str = "PDB";
+                        break;
+                    case SymExport:
+                        cs_entry.symbol_type_str = "-exported-";
+                        break;
+                    case SymDeferred:
+                        cs_entry.symbol_type_str = "-deferred-";
+                        break;
+                    case SymSym:
+                        cs_entry.symbol_type_str = "SYM";
+                        break;
 #if API_VERSION_NUMBER >= 9
-                case SymDia:
-                    cs_entry.symbol_type_str = "DIA";
-                    break;
+                    case SymDia:
+                        cs_entry.symbol_type_str = "DIA";
+                        break;
 #endif
-                case 8:    // SymVirtual:
-                    cs_entry.symbol_type_str = "Virtual";
-                    break;
-                default:
-                    //_snprintf( ty, sizeof(ty), "symtype=%ld", (long) module.SymType );
-                    cs_entry.symbol_type_str = NULL;
-                    break;
-                }
+                    case 8:    // SymVirtual:
+                        cs_entry.symbol_type_str = "Virtual";
+                        break;
+                    default:
+                        //_snprintf( ty, sizeof(ty), "symtype=%ld", (long) module.SymType );
+                        cs_entry.symbol_type_str = NULL;
+                        break;
+                    }
 
-                sw__strcpy(cs_entry.module_name, SW_MAX_NAME_LEN, module.ModuleName);
-                cs_entry.baseof_image = module.BaseOfImage;
-                sw__strcpy(cs_entry.loaded_image_name, SW_MAX_NAME_LEN, module.LoadedImageName);
-            }    // got module info OK
-            else {
-                 ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(), 
-                                                 s.AddrPC.Offset, ctx->callbacks_userptr);
+                    sw__strcpy(cs_entry.module_name, SW_MAX_NAME_LEN, module.ModuleName);
+                    cs_entry.baseof_image = module.BaseOfImage;
+                    sw__strcpy(cs_entry.loaded_image_name, SW_MAX_NAME_LEN, module.LoadedImageName);
+                }    // got module info OK
+                else {
+                    ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(), 
+                                                    s.AddrPC.Offset, ctx->callbacks_userptr);
+                }
             }
-        }    // we seem to have a valid PC
+        }    // s.AddrPC.Offset != 0
 
         // we skip the first one, because it's always from this function
         if (frame_num > 0) {
