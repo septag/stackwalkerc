@@ -1071,6 +1071,9 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
         cs_entry.line = 0;
         cs_entry.loaded_image_name[0] = 0;
         cs_entry.module_name[0] = 0;
+        cs_entry.symbol_type_str = "";
+        cs_entry.symbol_type = 0;
+
         if (s.AddrPC.Offset == s.AddrReturn.Offset) {
             if ((ctx->max_recursion > 0) && (cur_recursion_count > ctx->max_recursion)) {
                  ctx->callbacks.error_msg("StackWalk64-Endless-Callstack!", 0, s.AddrPC.Offset, ctx->callbacks_userptr);
@@ -1114,7 +1117,7 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
             }    // yes, we have SymGetLineFromAddr64()
 
             // show module info (SymGetModuleInfo64())
-            if (ctx->options && SW_OPTIONS_MODULEINFO) {
+            if (ctx->options & SW_OPTIONS_MODULEINFO) {
                 if (sw__get_module_info(&ctx->internal, ctx->process, s.AddrPC.Offset, &module)) {    // got module info OK
                     cs_entry.symbol_type = module.SymType;
                     switch (module.SymType) {
