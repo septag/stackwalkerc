@@ -14,12 +14,9 @@
 // History:
 //      1.0.0: Initial version
 //      1.0.1: Bugs fixed, taking more sw_option flags into action
+//      1.1.0: [BREAKING] Added extra userptr to show_callstack to override the callbacks ptr per-callstack
 //
 #pragma once
-
-#ifndef _WIN32
-#error "Platforms other than Windows are not supported"
-#endif
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -90,8 +87,7 @@ extern "C" {
 
 SW_API_DECL sw_context* sw_create_context_capture(uint32_t options, sw_callbacks callbacks, void* userptr);
 SW_API_DECL sw_context* sw_create_context_capture_other(uint32_t options, uint32_t process_id,
-                                                        sw_sys_handle process, sw_callbacks callbacks,
-                                                        void* userptr);
+                                                        sw_sys_handle process, sw_callbacks callbacks, void* userptr);
 SW_API_DECL sw_context* sw_create_context_exception(uint32_t options, 
                                                     sw_exception_pointers exp_ptrs,
                                                     sw_callbacks callbacks, void* userptr);
@@ -100,6 +96,7 @@ SW_API_DECL sw_context* sw_create_context_catch(uint32_t options, sw_callbacks c
 SW_API_DECL void sw_destroy_context(sw_context* ctx);
 
 SW_API_DECL void sw_set_symbol_path(sw_context* ctx, const char* sympath);
+SW_API_DECL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread_hdl /*=NULL*/, void* callbacks_userptr);
 SW_API_DECL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl /*=NULL*/);
 
 #ifdef __cplusplus
@@ -108,8 +105,15 @@ SW_API_DECL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl /*=
 
 #ifdef SW_IMPL
 
+#ifndef _WIN32
+#error "Platforms other than Windows are not supported"
+#endif
+
 #define WIN32_LEAN_AND_MEAN
+#pragma warning(push)
+#pragma warning(disable : 5105)
 #include <windows.h>
+#pragma warning(pop)
 #include <malloc.h> // alloca, malloc
 #include <string.h> // strlen, strcat_s
 
@@ -510,7 +514,7 @@ _SW_PRIVATE bool sw__get_module_list_PSAPI(sw_context_internal* ctxi, HANDLE pro
     HMODULE* mods = NULL;
     char* tt = NULL;
     char* tt2 = NULL;
-    const SIZE_T TTBUFLEN = 8096;
+    const DWORD TTBUFLEN = 8096;
     int cnt = 0;
 
     hPsapi = LoadLibraryA("psapi.dll");
@@ -951,7 +955,7 @@ _SW_PRIVATE BOOL __stdcall sw__read_proc_mem(HANDLE  hProcess,
     }
 }
 
-SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
+SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread_hdl, void* callbacks_userptr)
 {
     CONTEXT c;
     sw_callstack_entry cs_entry;
@@ -959,8 +963,9 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
     IMAGEHLP_MODULE64_V3 module;
     IMAGEHLP_LINE64 line;
     int frame_num;
-    bool first_entry_called = false;
     uint32_t cur_recursion_count = 0;
+
+    callbacks_userptr = callbacks_userptr ? callbacks_userptr : ctx->callbacks_userptr;
 
     if (thread_hdl == NULL) {
         thread_hdl = GetCurrentThread();
@@ -1057,7 +1062,7 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
                                         ctx->internal.fSymFunctionTableAccess64,
                                         ctx->internal.fSymGetModuleBase64, NULL)) {
             // INFO: "StackWalk64" does not set "GetLastError"...
-            ctx->callbacks.error_msg("StackWalk64", 0, s.AddrPC.Offset, ctx->callbacks_userptr);
+            ctx->callbacks.error_msg("StackWalk64", 0, s.AddrPC.Offset, callbacks_userptr);
             break;
         }
 
@@ -1071,12 +1076,9 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
         cs_entry.line = 0;
         cs_entry.loaded_image_name[0] = 0;
         cs_entry.module_name[0] = 0;
-        cs_entry.symbol_type_str = "";
-        cs_entry.symbol_type = 0;
-
         if (s.AddrPC.Offset == s.AddrReturn.Offset) {
             if ((ctx->max_recursion > 0) && (cur_recursion_count > ctx->max_recursion)) {
-                 ctx->callbacks.error_msg("StackWalk64-Endless-Callstack!", 0, s.AddrPC.Offset, ctx->callbacks_userptr);
+                 ctx->callbacks.error_msg("StackWalk64-Endless-Callstack!", 0, s.AddrPC.Offset, callbacks_userptr);
                 break;
             }
             cur_recursion_count++;
@@ -1098,7 +1100,7 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
                     if (gle == ERROR_INVALID_ADDRESS) {
                         break;
                     }                                                       
-                    ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, s.AddrPC.Offset, ctx->callbacks_userptr);
+                    ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, s.AddrPC.Offset, callbacks_userptr);
                 }
             }
 
@@ -1112,7 +1114,7 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
                     if (gle == ERROR_INVALID_ADDRESS) {
                         break;
                     }
-                    ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, s.AddrPC.Offset, ctx->callbacks_userptr);
+                    ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, s.AddrPC.Offset, callbacks_userptr);
                 }
             }    // yes, we have SymGetLineFromAddr64()
 
@@ -1161,8 +1163,7 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
                     sw__strcpy(cs_entry.loaded_image_name, SW_MAX_NAME_LEN, module.LoadedImageName);
                 }    // got module info OK
                 else {
-                    ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(), 
-                                                    s.AddrPC.Offset, ctx->callbacks_userptr);
+                    ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(),  s.AddrPC.Offset, callbacks_userptr);
                 }
             }
         }    // s.AddrPC.Offset != 0
@@ -1170,20 +1171,25 @@ SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
         // we skip the first one, because it's always from this function
         if (frame_num > 0) {
             if (ctx->callbacks.callstack_entry) {
-                ctx->callbacks.callstack_entry(&cs_entry, ctx->callbacks_userptr);
+                ctx->callbacks.callstack_entry(&cs_entry, callbacks_userptr);
             }
         } else {
             if (ctx->callbacks.callstack_begin) {
-                ctx->callbacks.callstack_begin(ctx->callbacks_userptr);
+                ctx->callbacks.callstack_begin(callbacks_userptr);
             }
         }
     }    // for ( frame_num )
 
     if (ctx->callbacks.callstack_end && frame_num > 1 ) {
-        ctx->callbacks.callstack_end(ctx->callbacks_userptr);
+        ctx->callbacks.callstack_end(callbacks_userptr);
     }
 
     return true;
+}
+
+SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
+{
+    return sw_show_callstack_userptr(ctx, thread_hdl, NULL);
 }
 
 #endif // SW_IMPL
