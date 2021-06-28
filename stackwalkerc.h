@@ -14,7 +14,7 @@
 // History:
 //      1.0.0: Initial version
 //      1.0.1: Bugs fixed, taking more sw_option flags into action
-//      1.1.0: [BREAKING] Added extra userptr to show_callstack to override the callbacks ptr per-callstack
+//      1.1.0: Added extra userptr to show_callstack_userptr to override the callbacks ptr per-callstack
 //
 #pragma once
 
