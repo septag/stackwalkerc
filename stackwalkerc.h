@@ -15,6 +15,10 @@
 //      1.0.0: Initial version
 //      1.0.1: Bugs fixed, taking more sw_option flags into action
 //      1.1.0: Added extra userptr to show_callstack_userptr to override the callbacks ptr per-callstack
+//      1.2.0: Added fast backtrace implementation for captures in current thread. 
+//             Added utility function sw_load_dbghelp
+//             Added limiter function sw_set_callstack_captures
+//      1.3.0  Added more advanced functions for resolving callstack lazily, sw_capture_current, sw_resolve_callstack
 //
 #pragma once
 
@@ -31,6 +35,10 @@
 
 #ifndef SW_MAX_NAME_LEN
 #define SW_MAX_NAME_LEN 1024
+#endif
+
+#ifndef SW_MAX_FRAMES
+#define SW_MAX_FRAMES 64
 #endif
 
 typedef enum sw_options
@@ -56,7 +64,6 @@ typedef struct sw_callstack_entry
     uint64_t    offset;
     char        name[SW_MAX_NAME_LEN];
     char        und_name[SW_MAX_NAME_LEN];
-    char        und_fullname[SW_MAX_NAME_LEN];
     uint64_t    offset_from_symbol;
     uint32_t    offset_from_line;
     uint32_t    line;
@@ -96,8 +103,15 @@ SW_API_DECL sw_context* sw_create_context_catch(uint32_t options, sw_callbacks c
 SW_API_DECL void sw_destroy_context(sw_context* ctx);
 
 SW_API_DECL void sw_set_symbol_path(sw_context* ctx, const char* sympath);
+SW_API_DECL void sw_set_callstack_captures(sw_context* ctx, uint32_t frames_to_skip, uint32_t frames_to_capture);
 SW_API_DECL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread_hdl /*=NULL*/, void* callbacks_userptr);
 SW_API_DECL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl /*=NULL*/);
+
+// manual/advanced functions
+SW_API_DECL sw_sys_handle sw_load_dbghelp(void);
+SW_API_DECL uint16_t sw_capture_current(sw_context* ctx, void* symbols[SW_MAX_FRAMES]);
+SW_API_DECL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_FRAMES], 
+                                          sw_callstack_entry entries[SW_MAX_FRAMES], uint16_t num_entries);
 
 #ifdef __cplusplus
 }
@@ -319,6 +333,8 @@ typedef struct sw_context
     uint32_t options;
     uint32_t max_recursion;
     sw_context_internal internal;
+    uint32_t    frames_to_skip;
+    uint32_t    frames_to_capture;
 } sw_context;
 
 _SW_PRIVATE bool sw__get_module_info(sw_context_internal* ctxi, HANDLE process, DWORD64 baseAddr, IMAGEHLP_MODULE64_V3* modinfo)
@@ -355,6 +371,41 @@ _SW_PRIVATE bool sw__get_module_info(sw_context_internal* ctxi, HANDLE process, 
     }
     SetLastError(ERROR_DLL_INIT_FAILED);
     return false;
+}
+
+_SW_PRIVATE bool sw__get_module_info_csentry(sw_context_internal* ctxi, HANDLE process, DWORD64 baseAddr, 
+                                             sw_callstack_entry* cs_entry)
+{
+    IMAGEHLP_MODULE64_V3 module;
+    memset(&module, 0x0, sizeof(module));
+    module.SizeOfStruct = sizeof(module);
+
+    bool r = sw__get_module_info(ctxi, process, baseAddr, &module);
+    if (r) {
+        SW_ASSERT(cs_entry);
+        cs_entry->symbol_type = module.SymType;
+
+        switch (module.SymType) {
+        case SymNone:       cs_entry->symbol_type_str = "-nosymbols-"; break;
+        case SymCoff:       cs_entry->symbol_type_str = "COFF";        break;
+        case SymCv:         cs_entry->symbol_type_str = "CV";          break;
+        case SymPdb:        cs_entry->symbol_type_str = "PDB";         break;
+        case SymExport:     cs_entry->symbol_type_str = "-exported-";  break;
+        case SymDeferred:   cs_entry->symbol_type_str = "-deferred-";  break;
+        case SymSym:        cs_entry->symbol_type_str = "SYM";         break;
+        #if API_VERSION_NUMBER >= 9
+        case SymDia:        cs_entry->symbol_type_str = "DIA";         break;
+        #endif
+        case 8:             cs_entry->symbol_type_str = "Virtual";     break;
+        default:            cs_entry->symbol_type_str = NULL;          break;
+        }
+
+        sw__strcpy(cs_entry->module_name, sizeof(cs_entry->module_name), module.ModuleName);
+        cs_entry->baseof_image = module.BaseOfImage;
+        sw__strcpy(cs_entry->loaded_image_name, sizeof(cs_entry->module_name), module.LoadedImageName);
+    }
+
+    return r;
 }
 
 _SW_PRIVATE DWORD sw__load_module(sw_context_internal* ctxi, HANDLE process, LPCSTR _img, LPCSTR _mod, 
@@ -399,34 +450,16 @@ _SW_PRIVATE DWORD sw__load_module(sw_context_internal* ctxi, HANDLE process, LPC
     const char* symtype = "-unknown-";
     if (sw__get_module_info(ctxi, process, base_addr, &module) != FALSE) {
         switch (module.SymType) {
-        case SymNone:
-            symtype = "-nosymbols-";
-            break;
-        case SymCoff:   // 1
-            symtype = "COFF";
-            break;
-        case SymCv:     // 2
-            symtype = "CV";
-            break;
-        case SymPdb:    // 3
-            symtype = "PDB";
-            break;
-        case SymExport: // 4
-            symtype = "-exported-";
-            break;
-        case SymDeferred:   // 5
-            symtype = "-deferred-";
-            break;
-        case SymSym:        // 6
-            symtype = "SYM";
-            break;
-        case 7:             // SymDia:
-            symtype = "DIA";
-            break;
-        case 8:             // SymVirtual:
-            symtype = "Virtual";
-            break;
-        default:  break;
+        case SymNone:       symtype = "-nosymbols-";    break;
+        case SymCoff:       symtype = "COFF";           break;
+        case SymCv:         symtype = "CV";             break;
+        case SymPdb:        symtype = "PDB";            break;
+        case SymExport:     symtype = "-exported-";     break;
+        case SymDeferred:   symtype = "-deferred-";     break;
+        case SymSym:        symtype = "SYM";            break;
+        case 7:             symtype = "DIA";            break;
+        case 8:             symtype = "Virtual";        break;
+        default:                                        break;
         }
     }
     LPCSTR pdb_name = module.LoadedImageName;
@@ -613,11 +646,14 @@ _SW_PRIVATE sw_context* sw__create_context(uint32_t options, uint32_t process_id
     ctx->internal.ctx.ContextFlags = 0;
     if (context_win)
         ctx->internal.ctx = *context_win;
+    ctx->frames_to_skip = 0;
+    ctx->frames_to_capture = 0xffffffff;
     return ctx;
 }
 
-_SW_PRIVATE bool sw__init_internal(sw_context_internal* ctxi, const char* sympath)
+SW_API_IMPL sw_sys_handle sw_load_dbghelp(void)
 {
+    HMODULE dbg_help = NULL;
     // Dynamically load the Entry-Points for dbghelp.dll:
     // First try to load the newest one from
     TCHAR temp[4096];
@@ -629,58 +665,87 @@ _SW_PRIVATE bool sw__init_internal(sw_context_internal* ctxi, const char* sympat
             // "Debugging Tools for Windows" Ok, first try the new path according to the
             // architecture:
 #ifdef _M_IX86
-            if ((ctxi->dbg_help == NULL) &&
-                (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+            if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
                 strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (x86)\\dbghelp.dll");
                 // now check if the file exists:
                 if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    ctxi->dbg_help = LoadLibraryA(temp);
+                    dbg_help = LoadLibraryA(temp);
                 }
             }
 #elif _M_X64
-            if ((ctxi->dbg_help == NULL) &&
-                (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+            if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
                 strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (x64)\\dbghelp.dll");
                 // now check if the file exists:
                 if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    ctxi->dbg_help = LoadLibraryA(temp);
+                    dbg_help = LoadLibraryA(temp);
                 }
             }
 #elif _M_IA64
-            if ((ctxi->dbg_help == NULL) &&
+            if ((dbg_help == NULL) &&
                 (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
                 strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (ia64)\\dbghelp.dll");
                 // now check if the file exists:
                 if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    ctxi->dbg_help = LoadLibraryA(temp);
+                    dbg_help = LoadLibraryA(temp);
                 }
             }
 #endif
             // If still not found, try the old directories...
-            if ((ctxi->dbg_help == NULL) &&
-                (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+            if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
                 strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows\\dbghelp.dll");
                 // now check if the file exists:
                 if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    ctxi->dbg_help = LoadLibraryA(temp);
+                    dbg_help = LoadLibraryA(temp);
+                }
+            }
+
+            // Try common visual studio folders
+            if ((dbg_help == NULL) &&  GetEnvironmentVariableA("ProgramFiles(x86)", temp, sizeof(temp))) {
+                #if _M_X64                  
+                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\2019\\Community\\Common7\\IDE\\Extensions\\TestPlatform\\Extensions\\Cpp\\x64\\dbghelp.dll");
+                #elif _M_IX86
+                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\2019\\Community\\Common7\\IDE\\Extensions\\TestPlatform\\Extensions\\Cpp\\dbghelp.dll");
+                #endif           
+                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+                    dbg_help = LoadLibraryA(temp);
+                }
+            }
+
+            if ((dbg_help == NULL) &&  GetEnvironmentVariableA("ProgramFiles(x86)", temp, sizeof(temp))) {
+                #if _M_X64                  
+                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\Shared\\Common\\VSPerfCollectionTools\\vs2019\\x64\\dbghelp.dll");
+                #elif _M_IX86
+                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\Shared\\Common\\VSPerfCollectionTools\\vs2019\\dbghelp.dll");
+                #endif           
+                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+                    dbg_help = LoadLibraryA(temp);
                 }
             }
 #if defined _M_X64 || defined _M_IA64
             // Still not found? Then try to load the (old) 64-Bit version:
-            if ((ctxi->dbg_help == NULL) &&
+            if ((dbg_help == NULL) &&
                 (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
                 strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows 64-Bit\\dbghelp.dll");
                 if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    ctxi->dbg_help = LoadLibraryA(temp);
+                    dbg_help = LoadLibraryA(temp);
                 }
             }
 #endif
         }
     }
-    if (ctxi->dbg_help == NULL)    // if not already loaded, try to load a default-one
-        ctxi->dbg_help = LoadLibraryA("dbghelp.dll");
-    if (ctxi->dbg_help == NULL)
+    if (dbg_help == NULL)    // if not already loaded, try to load a default-one
+        dbg_help = LoadLibraryA("dbghelp.dll");
+
+    return dbg_help;
+}
+
+_SW_PRIVATE bool sw__init_internal(sw_context_internal* ctxi, const char* sympath)
+{
+    ctxi->dbg_help = (HMODULE)sw_load_dbghelp();
+    if (ctxi->dbg_help == NULL) {
         return false;
+    }
+
     ctxi->fSymInitialize = (SymInitialize_t)GetProcAddress(ctxi->dbg_help, "SymInitialize");
     ctxi->fSymCleanup = (SymCleanup_t)GetProcAddress(ctxi->dbg_help, "SymCleanup");
 
@@ -869,6 +934,13 @@ SW_API_IMPL void sw_set_symbol_path(sw_context* ctx, const char* sympath)
     ctx->options |= SW_OPTIONS_SYMBUILDPATH;
 }
 
+SW_API_IMPL void sw_set_callstack_captures(sw_context* ctx, uint32_t frames_to_skip, uint32_t frames_to_capture)
+{
+    ctx->frames_to_skip = frames_to_skip;
+    ctx->frames_to_capture = frames_to_capture;
+}
+
+
 // The "ugly" assembler-implementation is needed for systems before XP
 // If you have a new PSDK and you only compile for XP and later, then you can use
 // the "RtlCaptureContext"
@@ -955,24 +1027,103 @@ _SW_PRIVATE BOOL __stdcall sw__read_proc_mem(HANDLE  hProcess,
     }
 }
 
+static bool sw_show_callstack_fast(sw_context* ctx, void* callbacks_userptr)
+{
+    sw_callstack_entry cs_entry;
+    IMAGEHLP_LINE64 line;
+    uint32_t max_frames = ctx->frames_to_capture != 0xffffffff ? ctx->frames_to_capture : SW_MAX_FRAMES;
+    max_frames = max_frames > SW_MAX_FRAMES ? SW_MAX_FRAMES : max_frames;
+
+    void** backtrace = (void**)alloca(sizeof(void*) * max_frames);
+    if (!backtrace) {
+        return false;
+    }
+
+    uint32_t frames_to_skip = ctx->frames_to_skip > 2 ? ctx->frames_to_skip : 2;
+    USHORT num_captures = RtlCaptureStackBackTrace(frames_to_skip, max_frames, backtrace, NULL);
+    if (num_captures == 0) {
+        return true;
+    }
+
+    IMAGEHLP_SYMBOL64* symbol = (IMAGEHLP_SYMBOL64*)alloca(sizeof(IMAGEHLP_SYMBOL64) + SW_MAX_NAME_LEN);
+    if (!symbol) {
+        return false;
+    }
+    memset(symbol, 0, sizeof(IMAGEHLP_SYMBOL64) + SW_MAX_NAME_LEN);
+    symbol->SizeOfStruct = sizeof(IMAGEHLP_SYMBOL64);
+    symbol->MaxNameLength = SW_MAX_NAME_LEN;
+
+    if (ctx->callbacks.callstack_begin) {
+        ctx->callbacks.callstack_begin(callbacks_userptr);
+    }
+
+    for (USHORT i = 0; i < num_captures; i++) {
+        memset(&cs_entry, 0x0, sizeof(cs_entry));
+        if ((ctx->options & SW_OPTIONS_SYMBOL) && ctx->internal.fSymGetSymFromAddr64 != NULL) {
+            if (ctx->internal.fSymGetSymFromAddr64(ctx->process, (DWORD64)backtrace[i], &(cs_entry.offset_from_symbol), symbol) != FALSE) {
+
+                sw__strcpy(cs_entry.name, sizeof(cs_entry.name), symbol->Name);
+                sw__strcpy(cs_entry.und_name, sizeof(cs_entry.und_name), symbol->Name);
+            } else {
+                DWORD gle = GetLastError();
+                if (gle == ERROR_INVALID_ADDRESS)
+                    break;
+                else if (gle == ERROR_MOD_NOT_FOUND)
+                    continue;
+                                      
+                ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, (uint64_t)backtrace[i], callbacks_userptr);
+                break;
+            }
+        }
+
+        // show line number info, NT5.0-method (SymGetLineFromAddr64())
+        if ((ctx->options && SW_OPTIONS_SOURCEPOS) && ctx->internal.fSymGetLineFromAddr64 != NULL) {    // yes, we have SymGetLineFromAddr64()
+            if (ctx->internal.fSymGetLineFromAddr64(ctx->process, (DWORD64)backtrace[i], (PDWORD)&(cs_entry.offset_from_line), &line) != FALSE) {
+                cs_entry.line = line.LineNumber;
+                sw__strcpy(cs_entry.line_filename, SW_MAX_NAME_LEN, line.FileName);
+            } else {
+                DWORD gle = GetLastError();
+                if (gle == ERROR_INVALID_ADDRESS)
+                    break;
+                else if (gle == ERROR_MOD_NOT_FOUND)
+                    continue;
+
+                ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, (uint64_t)backtrace[i], callbacks_userptr);
+                break;
+            }
+        }    // yes, we have SymGetLineFromAddr64()
+
+        // show module info (SymGetModuleInfo64())
+        if (ctx->options & SW_OPTIONS_MODULEINFO) {
+            if (!sw__get_module_info_csentry(&ctx->internal, ctx->process, (uint64_t)backtrace[i], &cs_entry)) {    // got module info OK
+                ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(),  (uint64_t)backtrace[i], callbacks_userptr);
+            }
+        }        
+
+        if (ctx->callbacks.callstack_entry) {
+            ctx->callbacks.callstack_entry(&cs_entry, callbacks_userptr);
+        }        
+    }
+
+    if (ctx->callbacks.callstack_end) {
+        ctx->callbacks.callstack_end(callbacks_userptr);
+    }    
+
+    return true;
+}
+
 SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread_hdl, void* callbacks_userptr)
 {
     CONTEXT c;
-    sw_callstack_entry cs_entry;
-    IMAGEHLP_SYMBOL64* symbol = NULL;
-    IMAGEHLP_MODULE64_V3 module;
-    IMAGEHLP_LINE64 line;
-    int frame_num;
-    uint32_t cur_recursion_count = 0;
-
     callbacks_userptr = callbacks_userptr ? callbacks_userptr : ctx->callbacks_userptr;
 
     if (thread_hdl == NULL) {
         thread_hdl = GetCurrentThread();
     }
 
-    if (!ctx->modules_loaded)
+    if (!ctx->modules_loaded) {
         sw__load_modules(ctx); 
+    }
 
     if (ctx->internal.dbg_help == NULL) {
         SetLastError(ERROR_DLL_INIT_FAILED);
@@ -982,10 +1133,12 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
     // If no context is provided, capture the context
     // See: https://stackwalker.codeplex.com/discussions/446958
     if (GetThreadId(thread_hdl) == GetCurrentThreadId()) {
-        if (ctx->internal.ctx.ContextFlags != 0)
+        if (ctx->internal.ctx.ContextFlags != 0) {
             c = ctx->internal.ctx;    // context taken at Init
-        else
-            GET_CURRENT_CONTEXT_STACKWALKER_CODEPLEX(c, USED_CONTEXT_FLAGS);
+        } else {
+            // Take the faster path
+            return sw_show_callstack_fast(ctx, callbacks_userptr);
+        }
     } else {
         SuspendThread(thread_hdl);
         memset(&c, 0, sizeof(CONTEXT));
@@ -1001,6 +1154,12 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
             return false;
         }
     }
+
+    sw_callstack_entry cs_entry;
+    IMAGEHLP_SYMBOL64* symbol = NULL;
+    IMAGEHLP_LINE64 line;
+    uint32_t frame_num;
+    uint32_t cur_recursion_count = 0;
 
     // init STACKFRAME for first call
     STACKFRAME64 s;    // in/out stackframe
@@ -1049,8 +1208,13 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
     memset(&line, 0, sizeof(line));
     line.SizeOfStruct = sizeof(line);
 
-    memset(&module, 0, sizeof(module));
-    module.SizeOfStruct = sizeof(module);
+    uint32_t frames_to_skip = ctx->frames_to_skip > 1 ? ctx->frames_to_skip : 1;
+    uint32_t max_frames = ctx->frames_to_capture != 0xffffffff ? ctx->frames_to_capture : SW_MAX_FRAMES;
+    max_frames = max_frames > SW_MAX_FRAMES ? SW_MAX_FRAMES : max_frames;
+
+    if (ctx->callbacks.callstack_begin) {
+        ctx->callbacks.callstack_begin(callbacks_userptr);
+    }
 
     for (frame_num = 0;; ++frame_num) {
         // get next stack frame (StackWalk64(), SymFunctionTableAccess64(), SymGetModuleBase64())
@@ -1066,10 +1230,16 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
             break;
         }
 
+        if (frame_num < frames_to_skip) {
+            continue;
+        }
+        if (frame_num >= max_frames) {
+            break;
+        }
+
         cs_entry.offset = s.AddrPC.Offset;
         cs_entry.name[0] = 0;
         cs_entry.und_name[0] = 0;
-        cs_entry.und_fullname[0] = 0;
         cs_entry.offset_from_symbol = 0;
         cs_entry.offset_from_line = 0;
         cs_entry.line_filename[0] = 0;
@@ -1093,13 +1263,13 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
                 if (ctx->internal.fSymGetSymFromAddr64(ctx->process, s.AddrPC.Offset, &(cs_entry.offset_from_symbol), symbol) != FALSE) {
 
                     sw__strcpy(cs_entry.name, SW_MAX_NAME_LEN, symbol->Name);
-                    ctx->internal.fUnDecorateSymbolName(symbol->Name, cs_entry.und_name, SW_MAX_NAME_LEN, UNDNAME_NAME_ONLY);
-                    ctx->internal.fUnDecorateSymbolName(symbol->Name, cs_entry.und_fullname, SW_MAX_NAME_LEN, UNDNAME_COMPLETE);
+                    ctx->internal.fUnDecorateSymbolName(symbol->Name, cs_entry.und_name, SW_MAX_NAME_LEN, UNDNAME_COMPLETE);
                 } else {
                     DWORD gle = GetLastError();
-                    if (gle == ERROR_INVALID_ADDRESS) {
+                    if (gle == ERROR_INVALID_ADDRESS)
                         break;
-                    }                                                       
+                    else if (gle == ERROR_MOD_NOT_FOUND)
+                        continue;
                     ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, s.AddrPC.Offset, callbacks_userptr);
                 }
             }
@@ -1111,72 +1281,25 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
                     sw__strcpy(cs_entry.line_filename, SW_MAX_NAME_LEN, line.FileName);
                 } else {
                     DWORD gle = GetLastError();
-                    if (gle == ERROR_INVALID_ADDRESS) {
+                    if (gle == ERROR_INVALID_ADDRESS)
                         break;
-                    }
+                    else if (gle == ERROR_MOD_NOT_FOUND)
+                        continue;
                     ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, s.AddrPC.Offset, callbacks_userptr);
                 }
             }    // yes, we have SymGetLineFromAddr64()
 
             // show module info (SymGetModuleInfo64())
             if (ctx->options & SW_OPTIONS_MODULEINFO) {
-                if (sw__get_module_info(&ctx->internal, ctx->process, s.AddrPC.Offset, &module)) {    // got module info OK
-                    cs_entry.symbol_type = module.SymType;
-                    switch (module.SymType) {
-                    case SymNone:
-                        cs_entry.symbol_type_str = "-nosymbols-";
-                        break;
-                    case SymCoff:
-                        cs_entry.symbol_type_str = "COFF";
-                        break;
-                    case SymCv:
-                        cs_entry.symbol_type_str = "CV";
-                        break;
-                    case SymPdb:
-                        cs_entry.symbol_type_str = "PDB";
-                        break;
-                    case SymExport:
-                        cs_entry.symbol_type_str = "-exported-";
-                        break;
-                    case SymDeferred:
-                        cs_entry.symbol_type_str = "-deferred-";
-                        break;
-                    case SymSym:
-                        cs_entry.symbol_type_str = "SYM";
-                        break;
-#if API_VERSION_NUMBER >= 9
-                    case SymDia:
-                        cs_entry.symbol_type_str = "DIA";
-                        break;
-#endif
-                    case 8:    // SymVirtual:
-                        cs_entry.symbol_type_str = "Virtual";
-                        break;
-                    default:
-                        //_snprintf( ty, sizeof(ty), "symtype=%ld", (long) module.SymType );
-                        cs_entry.symbol_type_str = NULL;
-                        break;
-                    }
-
-                    sw__strcpy(cs_entry.module_name, SW_MAX_NAME_LEN, module.ModuleName);
-                    cs_entry.baseof_image = module.BaseOfImage;
-                    sw__strcpy(cs_entry.loaded_image_name, SW_MAX_NAME_LEN, module.LoadedImageName);
-                }    // got module info OK
-                else {
+                if (!sw__get_module_info_csentry(&ctx->internal, ctx->process, s.AddrPC.Offset, &cs_entry)) {    // got module info OK
                     ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(),  s.AddrPC.Offset, callbacks_userptr);
                 }
             }
         }    // s.AddrPC.Offset != 0
 
         // we skip the first one, because it's always from this function
-        if (frame_num > 0) {
-            if (ctx->callbacks.callstack_entry) {
-                ctx->callbacks.callstack_entry(&cs_entry, callbacks_userptr);
-            }
-        } else {
-            if (ctx->callbacks.callstack_begin) {
-                ctx->callbacks.callstack_begin(callbacks_userptr);
-            }
+        if (ctx->callbacks.callstack_entry) {
+            ctx->callbacks.callstack_entry(&cs_entry, callbacks_userptr);
         }
     }    // for ( frame_num )
 
@@ -1190,6 +1313,86 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
 SW_API_IMPL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl)
 {
     return sw_show_callstack_userptr(ctx, thread_hdl, NULL);
+}
+
+SW_API_IMPL uint16_t sw_capture_current(sw_context* ctx, void* symbols[SW_MAX_FRAMES])
+{
+    SW_ASSERT(ctx);
+
+    if (!sw__load_modules(ctx)) {
+        return 0;
+    }
+
+    uint32_t max_frames = ctx->frames_to_capture != 0xffffffff ? ctx->frames_to_capture : SW_MAX_FRAMES;
+    max_frames = max_frames > SW_MAX_FRAMES ? SW_MAX_FRAMES : max_frames;
+
+    uint32_t frames_to_skip = ctx->frames_to_skip > 1 ? ctx->frames_to_skip : 1;
+    return (uint16_t)RtlCaptureStackBackTrace(frames_to_skip, max_frames, symbols, NULL);
+}
+
+SW_API_IMPL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_FRAMES], 
+                                          sw_callstack_entry entries[SW_MAX_FRAMES], uint16_t num_entries)
+{
+    IMAGEHLP_LINE64 line;
+
+    if (!sw__load_modules(ctx)) {
+        return 0;
+    }    
+
+    IMAGEHLP_SYMBOL64* symbol = (IMAGEHLP_SYMBOL64*)alloca(sizeof(IMAGEHLP_SYMBOL64) + SW_MAX_NAME_LEN);
+    if (!symbol) {
+        return false;
+    }
+    memset(symbol, 0, sizeof(IMAGEHLP_SYMBOL64) + SW_MAX_NAME_LEN);
+    symbol->SizeOfStruct = sizeof(IMAGEHLP_SYMBOL64);
+    symbol->MaxNameLength = SW_MAX_NAME_LEN;
+
+    uint16_t count = 0;
+    for (uint16_t i = 0; i < num_entries; i++) {
+        sw_callstack_entry entry = {0};
+        if ((ctx->options & SW_OPTIONS_SYMBOL) && ctx->internal.fSymGetSymFromAddr64 != NULL) {
+            if (ctx->internal.fSymGetSymFromAddr64(ctx->process, (DWORD64)symbols[i], &(entry.offset_from_symbol), symbol) != FALSE) {
+
+                sw__strcpy(entry.name, sizeof(entry.name), symbol->Name);
+                sw__strcpy(entry.und_name, sizeof(entry.und_name), symbol->Name);
+            } else {
+                DWORD gle = GetLastError();
+                if (gle == ERROR_INVALID_ADDRESS || gle == ERROR_MOD_NOT_FOUND) {
+                    continue;
+                }                                       
+                ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, (uint64_t)symbols[i], ctx->callbacks_userptr);
+                break;
+            }
+        }
+
+        // show line number info, NT5.0-method (SymGetLineFromAddr64())
+        if ((ctx->options && SW_OPTIONS_SOURCEPOS) && ctx->internal.fSymGetLineFromAddr64 != NULL) {    // yes, we have SymGetLineFromAddr64()
+            if (ctx->internal.fSymGetLineFromAddr64(ctx->process, (DWORD64)symbols[i], 
+                                                    (PDWORD)&(entry.offset_from_line), &line) != FALSE) 
+            {
+                entry.line = line.LineNumber;
+                sw__strcpy(entry.line_filename, SW_MAX_NAME_LEN, line.FileName);
+            } else {
+                DWORD gle = GetLastError();
+                if (gle == ERROR_INVALID_ADDRESS || gle == ERROR_MOD_NOT_FOUND) {
+                    continue;
+                }
+                ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, (uint64_t)symbols[i], ctx->callbacks_userptr);
+                break;
+            }
+        }    // yes, we have SymGetLineFromAddr64()
+
+        // show module info (SymGetModuleInfo64())
+        if (ctx->options & SW_OPTIONS_MODULEINFO) {
+            if (!sw__get_module_info_csentry(&ctx->internal, ctx->process, (uint64_t)symbols[i], &entry)) {    // got module info OK
+                ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(),  (uint64_t)symbols[i], ctx->callbacks_userptr);
+            }
+        }        
+
+        memcpy(&entries[count++], &entry, sizeof(sw_callstack_entry));
+    }
+
+    return count;
 }
 
 #endif // SW_IMPL

@@ -17,7 +17,7 @@ static void load_module(const char* img, const char* module, uint64_t base_addr,
 
 static void callstack_entry(const sw_callstack_entry* entry, void* userptr)
 {
-    printf("\t%s(%d): %s\n", entry->line_filename, entry->line, entry->und_fullname);
+    printf("\t%s(%d): %s\n", entry->line_filename, entry->line, entry->und_name);
 }
 
 static void callstack_begin(void* userptr)

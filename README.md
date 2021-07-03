@@ -12,6 +12,8 @@
 - Callstack reporting of other threads and processes
 - Callstack reporting in system exceptions
 - Does not depend on DbgHelp.DLL to be included with the executable, this library dynamically loads the DbgHelp.dll from common system paths
+- Fast code-path for current thread callstack captures
+- Manual callstack resolving for lazy symbol resolves
 
 ## Usage
 This is a single header library, so all you need is include the file in your source and you are good to go:
@@ -38,13 +40,19 @@ The API usage is super simple. There is more functionality like listing symbol s
 ```cpp
 static void callstack_entry(const sw_callstack_entry* entry, void* userptr)
 {
-    printf("\t%s(%d): %s\n", entry->line_filename, entry->line, entry->und_fullname);
+    printf("\t%s(%d): %s\n", entry->line_filename, entry->line, entry->und_name);
+}
+
+static void error_msg(const char* filename, uint32_t gle, uint64_t addr, void* userptr)
+{
+    printf("error: %s, ErrorCode: %u\n", filename, gle);
 }
 
 int main(int argc, char* argv[]) 
 {
     sw_callbacks callbacks = {
-        .callstack_entry = callstack_entry
+        .callstack_entry = callstack_entry,
+        .error_msg = error_msg
     };
     sw_context* stackwalk = sw_create_context_capture(SW_OPTIONS_ALL, callbacks, NULL);
     if (!stackwalk) {
