@@ -17,8 +17,10 @@
 //      1.1.0: Added extra userptr to show_callstack_userptr to override the callbacks ptr per-callstack
 //      1.2.0: Added fast backtrace implementation for captures in current thread. 
 //             Added utility function sw_load_dbghelp
-//             Added limiter function sw_set_callstack_captures
+//             Added limiter function sw_set_callstack_limits
 //      1.3.0  Added more advanced functions for resolving callstack lazily, sw_capture_current, sw_resolve_callstack
+//      1.4.0  Added module cache and reload modules on-demand
+//      1.5.0  House cleaning, added sw_set_dbghelp_hintpath, ditched error_msg callback for SW_LOG_ERROR macro
 //
 #pragma once
 
@@ -47,7 +49,6 @@ typedef enum sw_options
     SW_OPTIONS_SYMBOL        = 0x1,     // Get symbol names
     SW_OPTIONS_SOURCEPOS     = 0x2,     // Get symbol file+line
     SW_OPTIONS_MODULEINFO    = 0x4,     // Get module information
-    SW_OPTIONS_FILEVERSION   = 0x8,     // Get file version for modules
     SW_OPTIONS_VERBOSE       = 0xf,     // All above options
     SW_OPTIONS_SYMBUILDPATH  = 0x10,    // Generate a good symbol search path
     SW_OPTIONS_SYMUSESERVER  = 0x20,    // Use public microsoft symbol server
@@ -78,14 +79,10 @@ typedef struct sw_callstack_entry
 typedef struct sw_callbacks
 {
     void (*symbol_init)(const char* search_path, uint32_t sym_opts, void* userptr);
-    void (*load_module)(const char* img, const char* module, uint64_t base_addr, uint32_t size, 
-                        uint32_t result, const char* sym_type, const char* pdb_name, uint64_t file_version,
-                        void* userptr);
+    void (*load_module)(const char* img, const char* module, uint64_t base_addr, uint32_t size, void* userptr);
     void (*callstack_begin)(void* userptr);
     void (*callstack_entry)(const sw_callstack_entry* entry, void* userptr);
     void (*callstack_end)(void* userptr);
-
-    void (*error_msg)(const char* filename, uint32_t gle, uint64_t addr, void* userptr);
 } sw_callbacks;
 
 #ifdef __cplusplus
@@ -103,7 +100,7 @@ SW_API_DECL sw_context* sw_create_context_catch(uint32_t options, sw_callbacks c
 SW_API_DECL void sw_destroy_context(sw_context* ctx);
 
 SW_API_DECL void sw_set_symbol_path(sw_context* ctx, const char* sympath);
-SW_API_DECL void sw_set_callstack_captures(sw_context* ctx, uint32_t frames_to_skip, uint32_t frames_to_capture);
+SW_API_DECL void sw_set_callstack_limits(sw_context* ctx, uint32_t frames_to_skip, uint32_t frames_to_capture);
 SW_API_DECL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread_hdl /*=NULL*/, void* callbacks_userptr);
 SW_API_DECL bool sw_show_callstack(sw_context* ctx, sw_sys_handle thread_hdl /*=NULL*/);
 
@@ -112,6 +109,9 @@ SW_API_DECL sw_sys_handle sw_load_dbghelp(void);
 SW_API_DECL uint16_t sw_capture_current(sw_context* ctx, void* symbols[SW_MAX_FRAMES]);
 SW_API_DECL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_FRAMES], 
                                           sw_callstack_entry entries[SW_MAX_FRAMES], uint16_t num_entries);
+SW_API_DECL void sw_reload_modules(sw_context* ctx);
+SW_API_DECL bool sw_get_symbol_module(sw_context* ctx, void* symbol, char module_name[32]);
+SW_API_DECL void sw_set_dbghelp_hintpath(const char* path);
 
 #ifdef __cplusplus
 }
@@ -134,6 +134,11 @@ SW_API_DECL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_
 #ifndef SW_ASSERT
 #   include <assert.h>
 #   define SW_ASSERT(e)   assert(e)
+#endif
+
+#ifndef SW_LOG_ERROR
+#   include <stdio.h>
+#   define SW_LOG_ERROR(err_fmt, ...) printf(err_fmt "\n", ##__VA_ARGS__)
 #endif
 
 #ifndef SW_MALLOC
@@ -235,6 +240,7 @@ typedef DWORD64(__stdcall* SymLoadModule64_t)(IN HANDLE process,
                                               IN LPCSTR ModuleName,
                                               IN DWORD64 BaseOfDll,
                                               IN DWORD SizeOfDll);
+typedef BOOL(__stdcall* SymUnloadModule64_t)(IN HANDLE hProcess, IN DWORD64 BaseOfDll);                                              
 typedef DWORD(__stdcall* SymSetOptions_t)(IN DWORD SymOptions);
 typedef BOOL(__stdcall* StackWalk64_t)(DWORD                           MachineType,
                                        HANDLE                           process,
@@ -250,6 +256,7 @@ typedef DWORD(__stdcall WINAPI* UnDecorateSymbolName_t)(PCSTR DecoratedName,
                                                         DWORD UndecoratedLength,
                                                         DWORD Flags);
 typedef BOOL(__stdcall WINAPI* SymGetSearchPath_t)(HANDLE process, PSTR SearchPath, DWORD SearchPathLength);
+typedef BOOL(__stdcall WINAPI* EnumerateLoadedModules64_t)(HANDLE hProcess, PENUMLOADED_MODULES_CALLBACK64  EnumLoadedModulesCallback, PVOID UserContext);
 
 typedef BOOL(__stdcall* ReadProcessMemoryRoutine_t)(
       HANDLE  process,
@@ -301,6 +308,12 @@ void** __cdecl __current_exception_context();
 }
 #endif
 
+typedef struct sw_module_cache_item
+{
+    char    name[32];
+    DWORD64 base_addr;
+} sw_module_cache_item;
+
 typedef struct sw_context_internal
 {
     sw_context* parent;
@@ -311,15 +324,24 @@ typedef struct sw_context_internal
     SymFunctionTableAccess64_t fSymFunctionTableAccess64;
     SymGetModuleBase64_t fSymGetModuleBase64;
     SymGetModuleInfo64_t fSymGetModuleInfo64;
+    
     SymGetOptions_t fSymGetOptions;
     SymGetSymFromAddr64_t fSymGetSymFromAddr64;
     SymGetLineFromAddr64_t fSymGetLineFromAddr64;
     SymInitialize_t fSymInitialize;
     SymLoadModule64_t fSymLoadModule64;
+    SymUnloadModule64_t fSymUnloadModule64;
+    
     SymSetOptions_t fSymSetOptions;
     StackWalk64_t fStackWalk64;
     UnDecorateSymbolName_t fUnDecorateSymbolName;
     SymGetSearchPath_t fSymGetSearchPath;
+    EnumerateLoadedModules64_t fEnumerateLoadedModules64;
+
+    CRITICAL_SECTION modules_cs;
+    uint32_t num_modules;
+    uint32_t max_modules;
+    sw_module_cache_item* modules;
 } sw_context_internal;
 
 typedef struct sw_context
@@ -329,6 +351,8 @@ typedef struct sw_context
     sw_sys_handle process;
     uint32_t process_id;
     bool modules_loaded;
+    bool reload_modules;
+    bool fatal_error;       // cannot recover anymore
     char sympath[SW_MAX_NAME_LEN];
     uint32_t options;
     uint32_t max_recursion;
@@ -336,6 +360,8 @@ typedef struct sw_context
     uint32_t    frames_to_skip;
     uint32_t    frames_to_capture;
 } sw_context;
+
+static char sw__dbghelp_hintpath[SW_MAX_NAME_LEN];
 
 _SW_PRIVATE bool sw__get_module_info(sw_context_internal* ctxi, HANDLE process, DWORD64 baseAddr, IMAGEHLP_MODULE64_V3* modinfo)
 {
@@ -377,9 +403,6 @@ _SW_PRIVATE bool sw__get_module_info_csentry(sw_context_internal* ctxi, HANDLE p
                                              sw_callstack_entry* cs_entry)
 {
     IMAGEHLP_MODULE64_V3 module;
-    memset(&module, 0x0, sizeof(module));
-    module.SizeOfStruct = sizeof(module);
-
     bool r = sw__get_module_info(ctxi, process, baseAddr, &module);
     if (r) {
         SW_ASSERT(cs_entry);
@@ -408,74 +431,61 @@ _SW_PRIVATE bool sw__get_module_info_csentry(sw_context_internal* ctxi, HANDLE p
     return r;
 }
 
-_SW_PRIVATE DWORD sw__load_module(sw_context_internal* ctxi, HANDLE process, LPCSTR _img, LPCSTR _mod, 
-                                  DWORD64 base_addr, DWORD size)
+static BOOL sw__enum_loaded_modules_cb(PCSTR module_path, ULONGLONG module_base, ULONG module_size, PVOID userptr)
 {
-    char img_name[SW_MAX_NAME_LEN];
+    // resolve module name
     char module_name[SW_MAX_NAME_LEN];
-    
-    sw__strcpy(img_name, sizeof(img_name), _img);
-    sw__strcpy(module_name, sizeof(module_name), _mod);
+    const char* backslash = strrchr(module_path, '\\');
+    if (backslash) {
+        sw__strcpy(module_name, sizeof(module_name), backslash+1);
+    } else {
+        sw__strcpy(module_name, sizeof(module_name), module_path);
+    }
+    sw_context_internal* ctxi = (sw_context_internal*)userptr;
+    EnterCriticalSection(&ctxi->modules_cs);
+    // don't Load modules that are already in the cache
+    for (uint32_t mi = 0; mi < ctxi->num_modules; mi++) {
+        if (strcmp(ctxi->modules[mi].name, module_name) == 0) {
+            LeaveCriticalSection(&ctxi->modules_cs);
+            return ERROR_SUCCESS;
+        }
+    }
+    LeaveCriticalSection(&ctxi->modules_cs);
 
-    DWORD result = ERROR_SUCCESS;
-    if (ctxi->fSymLoadModule64(process, 0, img_name, module_name, base_addr, size) == 0)
-        result = GetLastError();
+    DWORD64 mod_addr = ctxi->fSymLoadModule64(ctxi->process, NULL, module_path, module_name, module_base, module_size);
+    if (mod_addr == 0) {
+        return FALSE;
+    } else {
+        EnterCriticalSection(&ctxi->modules_cs);
 
-    ULONGLONG file_ver = 0;
-    SW_ASSERT(ctxi->parent);
-    // try to retrieve the file-version:
-    if ((ctxi->parent->options & SW_OPTIONS_FILEVERSION) != 0) {
-        VS_FIXEDFILEINFO* fInfo = NULL;
-        DWORD dwHandle;
-        DWORD ver_size = GetFileVersionInfoSizeA(img_name, &dwHandle);
-        if (ver_size > 0) {
-            LPVOID data = SW_MALLOC(ver_size);
-            if (data != NULL) {
-                if (GetFileVersionInfoA(img_name, dwHandle, ver_size, data) != 0) {
-                    UINT len;
-                    char subblock[] = "\\";
-                    if (VerQueryValueA(data, subblock, (LPVOID*)&fInfo, &len) == 0)
-                        fInfo = NULL;
-                    else {
-                        file_ver = ((ULONGLONG)fInfo->dwFileVersionLS) +((ULONGLONG)fInfo->dwFileVersionMS << 32);
-                    }
-                }
-                SW_FREE(data);
+        // Add the module to cache
+        if (ctxi->num_modules == ctxi->max_modules) {
+            ctxi->max_modules <<= 1;
+            sw_module_cache_item* modules = (sw_module_cache_item*)SW_MALLOC(ctxi->max_modules*sizeof(sw_module_cache_item));
+            if (!modules) {
+                LeaveCriticalSection(&ctxi->modules_cs);
+                SW_ASSERT(0);
+                return 0;
             }
+            memcpy(modules, ctxi->modules, ctxi->num_modules*sizeof(sw_module_cache_item));
+            SW_FREE(ctxi->modules);
+            ctxi->modules = modules;
         }
-    }
 
-    // Retrieve some additional-infos about the module
-    IMAGEHLP_MODULE64_V3 module;
-    const char* symtype = "-unknown-";
-    if (sw__get_module_info(ctxi, process, base_addr, &module) != FALSE) {
-        switch (module.SymType) {
-        case SymNone:       symtype = "-nosymbols-";    break;
-        case SymCoff:       symtype = "COFF";           break;
-        case SymCv:         symtype = "CV";             break;
-        case SymPdb:        symtype = "PDB";            break;
-        case SymExport:     symtype = "-exported-";     break;
-        case SymDeferred:   symtype = "-deferred-";     break;
-        case SymSym:        symtype = "SYM";            break;
-        case 7:             symtype = "DIA";            break;
-        case 8:             symtype = "Virtual";        break;
-        default:                                        break;
-        }
+        sw_module_cache_item* mcache = &ctxi->modules[ctxi->num_modules++];
+        sw__strcpy(mcache->name, sizeof(mcache->name), module_name);
+        mcache->base_addr = mod_addr;
+        LeaveCriticalSection(&ctxi->modules_cs);
     }
-    LPCSTR pdb_name = module.LoadedImageName;
-    if (module.LoadedPdbName[0] != 0)
-        pdb_name = module.LoadedPdbName;
 
     if (ctxi->parent->callbacks.load_module) {
-        ctxi->parent->callbacks.load_module(img_name, module_name, base_addr, size, result, symtype, pdb_name, 
-                                            file_ver, ctxi->parent->callbacks_userptr);
-    }
-    return result;
+        ctxi->parent->callbacks.load_module(module_path, module_name, mod_addr, module_size, ctxi->parent->callbacks_userptr);
+    }    
+
+    return TRUE;
 }
 
-
-
-_SW_PRIVATE bool sw__get_module_list_TH32(sw_context_internal* ctxi, HANDLE process, DWORD pid)
+_SW_PRIVATE bool sw__get_module_list_TH32(sw_context_internal* ctxi, DWORD pid)
 {
     typedef HANDLE(__stdcall * CreateToolhelp32Snapshot_t)(DWORD dwFlags, DWORD th32ProcessID);
     typedef BOOL(__stdcall * Module32First_t)(HANDLE hSnapshot, LPMODULEENTRY32 lpme);
@@ -519,7 +529,7 @@ _SW_PRIVATE bool sw__get_module_list_TH32(sw_context_internal* ctxi, HANDLE proc
     keepGoing = !!fModule32First(hSnap, &me);
     int cnt = 0;
     while (keepGoing) {
-        sw__load_module(ctxi, process, me.szExePath, me.szModule, (DWORD64)me.modBaseAddr, me.modBaseSize);
+        sw__enum_loaded_modules_cb(me.szExePath, (DWORD64)me.modBaseAddr, me.modBaseSize, ctxi);
         cnt++;
         keepGoing = !!fModule32Next(hSnap, &me);
     }
@@ -528,97 +538,12 @@ _SW_PRIVATE bool sw__get_module_list_TH32(sw_context_internal* ctxi, HANDLE proc
     return (cnt <= 0) ? false : true;
 }    // sw__get_module_list_TH32
 
-_SW_PRIVATE bool sw__get_module_list_PSAPI(sw_context_internal* ctxi, HANDLE process)
-{
-    typedef BOOL(__stdcall * EnumProcessModules_t)(HANDLE process, HMODULE * lphModule, DWORD cb, LPDWORD lpcbNeeded);
-    typedef DWORD(__stdcall * GetModuleFileNameEx_t)(HANDLE process, HMODULE hModule, LPSTR lpFilename, DWORD nSize);
-    typedef DWORD(__stdcall * GetModuleBaseName_t)(HANDLE process, HMODULE hModule, LPSTR lpFilename, DWORD nSize);
-    typedef BOOL(__stdcall * GetModuleInformation_t)(HANDLE process, HMODULE hModule, LPMODULEINFO pmi, DWORD nSize);
-
-    HINSTANCE hPsapi;
-    EnumProcessModules_t fEnumProcessModules;
-    GetModuleFileNameEx_t fGetModuleFileNameEx;
-    GetModuleBaseName_t fGetModuleBaseName;
-    GetModuleInformation_t fGetModuleInformation;
-
-    DWORD i;
-    DWORD num_needed;
-    MODULEINFO mi;
-    HMODULE* mods = NULL;
-    char* tt = NULL;
-    char* tt2 = NULL;
-    const DWORD TTBUFLEN = 8096;
-    int cnt = 0;
-
-    hPsapi = LoadLibraryA("psapi.dll");
-    if (hPsapi == NULL)
-        return FALSE;
-
-    fEnumProcessModules = (EnumProcessModules_t)GetProcAddress(hPsapi, "EnumProcessModules");
-    fGetModuleFileNameEx = (GetModuleFileNameEx_t)GetProcAddress(hPsapi, "GetModuleFileNameExA");
-    fGetModuleBaseName = (GetModuleFileNameEx_t)GetProcAddress(hPsapi, "GetModuleBaseNameA");
-    fGetModuleInformation = (GetModuleInformation_t)GetProcAddress(hPsapi, "GetModuleInformation");
-    if ((fEnumProcessModules == NULL) || (fGetModuleFileNameEx == NULL) ||
-        (fGetModuleFileNameEx == NULL) || (fGetModuleInformation == NULL)) {
-        // we couldn't find all functions
-        FreeLibrary(hPsapi);
-        return FALSE;
-    }
-
-    mods = (HMODULE*)SW_MALLOC(sizeof(HMODULE) * (TTBUFLEN / sizeof(HMODULE)));
-    tt = (char*)SW_MALLOC(sizeof(char) * TTBUFLEN);
-    tt2 = (char*)SW_MALLOC(sizeof(char) * TTBUFLEN);
-    if ((mods == NULL) || (tt == NULL) || (tt2 == NULL))
-        goto cleanup;
-
-    if (!fEnumProcessModules(process, mods, TTBUFLEN, &num_needed)) {
-        //_ftprintf(fLogFile, _T("%lu: EPM failed, GetLastError = %lu\n"), g_dwShowCount, gle );
-        goto cleanup;
-    }
-
-    if (num_needed > TTBUFLEN) {
-        //_ftprintf(fLogFile, _T("%lu: More than %lu module handles. Huh?\n"), g_dwShowCount, lenof(
-        //mods ) );
-        goto cleanup;
-    }
-
-    for (i = 0; i < num_needed / sizeof(mods[0]); i++) {
-        // base address, size
-        fGetModuleInformation(process, mods[i], &mi, sizeof(mi));
-        // image file name
-        tt[0] = 0;
-        fGetModuleFileNameEx(process, mods[i], tt, TTBUFLEN);
-        // module name
-        tt2[0] = 0;
-        fGetModuleBaseName(process, mods[i], tt2, TTBUFLEN);
-
-        DWORD dwRes = sw__load_module(ctxi, process, tt, tt2, (DWORD64)mi.lpBaseOfDll, mi.SizeOfImage);
-        if (dwRes != ERROR_SUCCESS)
-            ctxi->parent->callbacks.error_msg("sw__load_module", dwRes, 0, ctxi->parent->callbacks_userptr);
-        cnt++;
-    }
-
-cleanup:
-    if (hPsapi != NULL)
-        FreeLibrary(hPsapi);
-    if (tt2 != NULL)
-        SW_FREE(tt2);
-    if (tt != NULL)
-        SW_FREE(tt);
-    if (mods != NULL)
-        SW_FREE(mods);
-
-    return cnt != 0;
-}    // sw__get_module_list_PSAPI
-
-
 _SW_PRIVATE bool sw__load_modules_internal(sw_context_internal* ctxi, HANDLE process, DWORD process_id)
 {
-    // first try toolhelp32
-    if (sw__get_module_list_TH32(ctxi, process, process_id))
-        return true;
-    // then try psapi
-    return sw__get_module_list_PSAPI(ctxi, process);
+    if (!sw__get_module_list_TH32(ctxi, process_id)) {
+        return ctxi->fEnumerateLoadedModules64(process, sw__enum_loaded_modules_cb, ctxi) ? true : false;
+    }
+    return true;
 }
 
 _SW_PRIVATE PCONTEXT get_current_exception_context()
@@ -651,88 +576,69 @@ _SW_PRIVATE sw_context* sw__create_context(uint32_t options, uint32_t process_id
     return ctx;
 }
 
-SW_API_IMPL sw_sys_handle sw_load_dbghelp(void)
+SW_API_IMPL sw_sys_handle sw_load_dbghelp()
 {
     HMODULE dbg_help = NULL;
     // Dynamically load the Entry-Points for dbghelp.dll:
     // First try to load the newest one from
     TCHAR temp[4096];
-    // But before we do this, we first check if the ".local" file exists
-    if (GetModuleFileName(NULL, temp, sizeof(temp)) > 0) {
-        strcat_s(temp, sizeof(temp), ".local");
-        if (GetFileAttributes(temp) == INVALID_FILE_ATTRIBUTES) {
-            // ".local" file does not exist, so we can try to load the dbghelp.dll from the
-            // "Debugging Tools for Windows" Ok, first try the new path according to the
-            // architecture:
-#ifdef _M_IX86
-            if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
-                strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (x86)\\dbghelp.dll");
-                // now check if the file exists:
-                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    dbg_help = LoadLibraryA(temp);
-                }
-            }
-#elif _M_X64
-            if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
-                strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (x64)\\dbghelp.dll");
-                // now check if the file exists:
-                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    dbg_help = LoadLibraryA(temp);
-                }
-            }
-#elif _M_IA64
-            if ((dbg_help == NULL) &&
-                (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
-                strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (ia64)\\dbghelp.dll");
-                // now check if the file exists:
-                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    dbg_help = LoadLibraryA(temp);
-                }
-            }
-#endif
-            // If still not found, try the old directories...
-            if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
-                strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows\\dbghelp.dll");
-                // now check if the file exists:
-                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    dbg_help = LoadLibraryA(temp);
-                }
-            }
 
-            // Try common visual studio folders
-            if ((dbg_help == NULL) &&  GetEnvironmentVariableA("ProgramFiles(x86)", temp, sizeof(temp))) {
-                #if _M_X64                  
-                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\2019\\Community\\Common7\\IDE\\Extensions\\TestPlatform\\Extensions\\Cpp\\x64\\dbghelp.dll");
-                #elif _M_IX86
-                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\2019\\Community\\Common7\\IDE\\Extensions\\TestPlatform\\Extensions\\Cpp\\dbghelp.dll");
-                #endif           
-                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    dbg_help = LoadLibraryA(temp);
-                }
-            }
-
-            if ((dbg_help == NULL) &&  GetEnvironmentVariableA("ProgramFiles(x86)", temp, sizeof(temp))) {
-                #if _M_X64                  
-                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\Shared\\Common\\VSPerfCollectionTools\\vs2019\\x64\\dbghelp.dll");
-                #elif _M_IX86
-                    strcat_s(temp, sizeof(temp), "\\Microsoft Visual Studio\\Shared\\Common\\VSPerfCollectionTools\\vs2019\\dbghelp.dll");
-                #endif           
-                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    dbg_help = LoadLibraryA(temp);
-                }
-            }
-#if defined _M_X64 || defined _M_IA64
-            // Still not found? Then try to load the (old) 64-Bit version:
-            if ((dbg_help == NULL) &&
-                (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
-                strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows 64-Bit\\dbghelp.dll");
-                if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
-                    dbg_help = LoadLibraryA(temp);
-                }
-            }
-#endif
+    if (sw__dbghelp_hintpath[0]) {
+        sw__strcpy(temp, sizeof(temp), sw__dbghelp_hintpath);
+        strcat_s(temp, sizeof(temp), "\\dbghelp.dll");
+        if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+            dbg_help = LoadLibraryA(temp);
         }
     }
+
+    // ".local" file does not exist, so we can try to load the dbghelp.dll from the
+    // "Debugging Tools for Windows" Ok, first try the new path according to the
+    // architecture:
+    #ifdef _M_IX86
+    if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+        strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (x86)\\dbghelp.dll");
+        // now check if the file exists:
+        if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+            dbg_help = LoadLibraryA(temp);
+        }
+    }
+    #elif _M_X64
+    if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+        strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (x64)\\dbghelp.dll");
+        // now check if the file exists:
+        if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+            dbg_help = LoadLibraryA(temp);
+        }
+    }
+    #elif _M_IA64
+    if ((dbg_help == NULL) &&
+        (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+        strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows (ia64)\\dbghelp.dll");
+        // now check if the file exists:
+        if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+            dbg_help = LoadLibraryA(temp);
+        }
+    }
+    #endif
+
+    // If still not found, try the old directories...
+    if ((dbg_help == NULL) && (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+        strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows\\dbghelp.dll");
+        // now check if the file exists:
+        if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+            dbg_help = LoadLibraryA(temp);
+        }
+    }
+    #if defined _M_X64 || defined _M_IA64
+    // Still not found? Then try to load the (old) 64-Bit version:
+    if ((dbg_help == NULL) &&
+        (GetEnvironmentVariableA("ProgramFiles", temp, sizeof(temp)) > 0)) {
+        strcat_s(temp, sizeof(temp), "\\Debugging Tools for Windows 64-Bit\\dbghelp.dll");
+        if (GetFileAttributes(temp) != INVALID_FILE_ATTRIBUTES) {
+            dbg_help = LoadLibraryA(temp);
+        }
+    }
+    #endif
     if (dbg_help == NULL)    // if not already loaded, try to load a default-one
         dbg_help = LoadLibraryA("dbghelp.dll");
 
@@ -760,12 +666,16 @@ _SW_PRIVATE bool sw__init_internal(sw_context_internal* ctxi, const char* sympat
     ctxi->fSymGetSymFromAddr64 = (SymGetSymFromAddr64_t)GetProcAddress(ctxi->dbg_help, "SymGetSymFromAddr64");
     ctxi->fUnDecorateSymbolName = (UnDecorateSymbolName_t)GetProcAddress(ctxi->dbg_help, "UnDecorateSymbolName");
     ctxi->fSymLoadModule64 = (SymLoadModule64_t)GetProcAddress(ctxi->dbg_help, "SymLoadModule64");
+    ctxi->fSymUnloadModule64 = (SymUnloadModule64_t)GetProcAddress(ctxi->dbg_help, "SymUnloadModule64");
     ctxi->fSymGetSearchPath = (SymGetSearchPath_t)GetProcAddress(ctxi->dbg_help, "SymGetSearchPath");
+    ctxi->fEnumerateLoadedModules64 = (EnumerateLoadedModules64_t)GetProcAddress(ctxi->dbg_help, "EnumerateLoadedModules64");
 
     if (ctxi->fSymCleanup == NULL || ctxi->fSymFunctionTableAccess64 == NULL || ctxi->fSymGetModuleBase64 == NULL ||
         ctxi->fSymGetModuleInfo64 == NULL || ctxi->fSymGetOptions == NULL || ctxi->fSymGetSymFromAddr64 == NULL ||
         ctxi->fSymInitialize == NULL || ctxi->fSymSetOptions == NULL || ctxi->fStackWalk64 == NULL ||
-        ctxi->fUnDecorateSymbolName == NULL || ctxi->fSymLoadModule64 == NULL) {
+        ctxi->fUnDecorateSymbolName == NULL || ctxi->fSymLoadModule64 == NULL || ctxi->fSymUnloadModule64 == NULL || 
+        ctxi->fEnumerateLoadedModules64 == NULL) 
+    {
         FreeLibrary(ctxi->dbg_help);
         ctxi->dbg_help = NULL;
         ctxi->fSymCleanup = NULL;
@@ -773,8 +683,10 @@ _SW_PRIVATE bool sw__init_internal(sw_context_internal* ctxi, const char* sympat
     }
 
     // SymInitialize
-    if (ctxi->fSymInitialize(ctxi->process, sympath, FALSE) == FALSE)
-        ctxi->parent->callbacks.error_msg("SymInitialize", GetLastError(), 0, ctxi->parent->callbacks_userptr);
+    if (ctxi->fSymInitialize(ctxi->process, sympath, FALSE) == FALSE) {
+        SW_LOG_ERROR("SymInitialize failed (ErrorCode=%lu)", GetLastError());
+        return false;
+    }
 
     DWORD sym_opts = ctxi->fSymGetOptions();    // SymGetOptions
     sym_opts |= SYMOPT_LOAD_LINES;
@@ -784,11 +696,19 @@ _SW_PRIVATE bool sw__init_internal(sw_context_internal* ctxi, const char* sympat
     char buf[SW_MAX_NAME_LEN] = { 0 };
     if (ctxi->fSymGetSearchPath != NULL) {
         if (ctxi->fSymGetSearchPath(ctxi->process, buf, SW_MAX_NAME_LEN) == FALSE)
-            ctxi->parent->callbacks.error_msg("SymGetSearchPath", GetLastError(), 0, ctxi->parent->callbacks_userptr);
+            SW_LOG_ERROR("SymGetSearchPath failed (ErrorCode=%lu)", GetLastError());
     }
 
     if (ctxi->parent->callbacks.symbol_init) {
         ctxi->parent->callbacks.symbol_init(buf, sym_opts, ctxi->parent->callbacks_userptr);
+    }
+
+    // initialize module cache 
+    InitializeCriticalSection(&ctxi->modules_cs);
+    ctxi->max_modules = 32;
+    ctxi->modules = (sw_module_cache_item*)SW_MALLOC(ctxi->max_modules*sizeof(sw_module_cache_item));
+    if (!ctxi->modules) {
+        return false;
     }
 
     return true;
@@ -796,6 +716,9 @@ _SW_PRIVATE bool sw__init_internal(sw_context_internal* ctxi, const char* sympat
 
 _SW_PRIVATE bool sw__load_modules(sw_context* ctx)
 {
+    if (ctx->fatal_error) 
+        return false;
+    
     if (ctx->modules_loaded)
         return true;
 
@@ -868,8 +791,9 @@ _SW_PRIVATE bool sw__load_modules(sw_context* ctx)
 
     // First Init the whole stuff...
     if (!sw__init_internal(&ctx->internal, sympath)) {
-        ctx->callbacks.error_msg("Error while initializing dbghelp.dll", 0, 0, ctx->callbacks_userptr);
+        SW_LOG_ERROR("Error initializing dbghelp.dll");
         SetLastError(ERROR_DLL_INIT_FAILED);
+        ctx->fatal_error = true;
         return false;
     }
 
@@ -915,6 +839,9 @@ SW_API_IMPL sw_context* sw_create_context_catch(uint32_t options, sw_callbacks c
 SW_API_IMPL void sw_destroy_context(sw_context* ctx)
 {
     if (ctx) {
+        SW_FREE(ctx->internal.modules);
+        DeleteCriticalSection(&ctx->internal.modules_cs);
+
         if (ctx->internal.fSymCleanup)
             ctx->internal.fSymCleanup(ctx->process);
         if (ctx->internal.dbg_help)
@@ -934,73 +861,11 @@ SW_API_IMPL void sw_set_symbol_path(sw_context* ctx, const char* sympath)
     ctx->options |= SW_OPTIONS_SYMBUILDPATH;
 }
 
-SW_API_IMPL void sw_set_callstack_captures(sw_context* ctx, uint32_t frames_to_skip, uint32_t frames_to_capture)
+SW_API_IMPL void sw_set_callstack_limits(sw_context* ctx, uint32_t frames_to_skip, uint32_t frames_to_capture)
 {
     ctx->frames_to_skip = frames_to_skip;
     ctx->frames_to_capture = frames_to_capture;
 }
-
-
-// The "ugly" assembler-implementation is needed for systems before XP
-// If you have a new PSDK and you only compile for XP and later, then you can use
-// the "RtlCaptureContext"
-// Currently there is no define which determines the PSDK-Version...
-// So we just use the compiler-version (and assumes that the PSDK is
-// the one which was installed by the VS-IDE)
-
-// INFO: If you want, you can use the RtlCaptureContext if you only target XP and later...
-//       But I currently use it in x64/IA64 environments...
-//#if defined(_M_IX86) && (_WIN32_WINNT <= 0x0500) && (_MSC_VER < 1400)
-
-#if defined(_M_IX86)
-#ifdef CURRENT_THREAD_VIA_EXCEPTION
-// TODO: The following is not a "good" implementation,
-// because the callstack is only valid in the "__except" block...
-#define GET_CURRENT_CONTEXT_STACKWALKER_CODEPLEX(c, contextFlags)               \
-  do                                                                            \
-  {                                                                             \
-    memset(&c, 0, sizeof(CONTEXT));                                             \
-    EXCEPTION_POINTERS* pExp = NULL;                                            \
-    __try                                                                       \
-    {                                                                           \
-      throw 0;                                                                  \
-    }                                                                           \
-    __except (((pExp = GetExceptionInformation()) ? EXCEPTION_EXECUTE_HANDLER   \
-                                                  : EXCEPTION_EXECUTE_HANDLER)) \
-    {                                                                           \
-    }                                                                           \
-    if (pExp != NULL)                                                           \
-      memcpy(&c, pExp->ContextRecord, sizeof(CONTEXT));                         \
-    c.ContextFlags = contextFlags;                                              \
-  } while (0);
-#else
-// clang-format off
-// The following should be enough for walking the callstack...
-#define GET_CURRENT_CONTEXT_STACKWALKER_CODEPLEX(c, contextFlags) \
-  do                                                              \
-  {                                                               \
-    memset(&c, 0, sizeof(CONTEXT));                               \
-    c.ContextFlags = contextFlags;                                \
-    __asm    call x                                               \
-    __asm x: pop eax                                              \
-    __asm    mov c.Eip, eax                                       \
-    __asm    mov c.Ebp, ebp                                       \
-    __asm    mov c.Esp, esp                                       \
-  } while (0)
-// clang-format on
-#endif
-
-#else
-
-// The following is defined for x86 (XP and higher), x64 and IA64:
-#define GET_CURRENT_CONTEXT_STACKWALKER_CODEPLEX(c, contextFlags) \
-  do                                                              \
-  {                                                               \
-    memset(&c, 0, sizeof(CONTEXT));                               \
-    c.ContextFlags = contextFlags;                                \
-    RtlCaptureContext(&c);                                        \
-  } while (0);
-#endif
 
 // The following is used to pass the "userData"-Pointer to the user-provided readMemoryFunction
 // This has to be done due to a problem with the "hProcess"-parameter in x64...
@@ -1019,8 +884,6 @@ _SW_PRIVATE BOOL __stdcall sw__read_proc_mem(HANDLE  hProcess,
         SIZE_T st;
         BOOL ret = ReadProcessMemory(hProcess, (LPVOID)qwBaseAddress, lpBuffer, nSize, &st);
         *lpNumberOfBytesRead = (DWORD)st;
-        // printf("ReadMemory: hProcess: %p, baseAddr: %p, buffer: %p, size: %d, read: %d, result:
-        // %d\n", hProcess, (LPVOID) qwBaseAddress, lpBuffer, nSize, (DWORD) st, (DWORD) ret);
         return ret;
     } else {
         return s_read_mem_func(hProcess, qwBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead, s_read_mem_func_userdata);
@@ -1071,7 +934,7 @@ static bool sw_show_callstack_fast(sw_context* ctx, void* callbacks_userptr)
                 else if (gle == ERROR_MOD_NOT_FOUND)
                     continue;
                                       
-                ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, (uint64_t)backtrace[i], callbacks_userptr);
+                SW_LOG_ERROR("SymGetSymFromAddr64 failed (ErrorCode=%lu)", gle);
                 break;
             }
         }
@@ -1088,7 +951,7 @@ static bool sw_show_callstack_fast(sw_context* ctx, void* callbacks_userptr)
                 else if (gle == ERROR_MOD_NOT_FOUND)
                     continue;
 
-                ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, (uint64_t)backtrace[i], callbacks_userptr);
+                SW_LOG_ERROR("SymGetLineFromAddr64 failed (ErrorCode=%lu)", gle);
                 break;
             }
         }    // yes, we have SymGetLineFromAddr64()
@@ -1096,7 +959,7 @@ static bool sw_show_callstack_fast(sw_context* ctx, void* callbacks_userptr)
         // show module info (SymGetModuleInfo64())
         if (ctx->options & SW_OPTIONS_MODULEINFO) {
             if (!sw__get_module_info_csentry(&ctx->internal, ctx->process, (uint64_t)backtrace[i], &cs_entry)) {    // got module info OK
-                ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(),  (uint64_t)backtrace[i], callbacks_userptr);
+                SW_LOG_ERROR("SymGetModuleInfo64 failed (ErrorCode=%lu)", GetLastError());
             }
         }        
 
@@ -1123,6 +986,11 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
 
     if (!ctx->modules_loaded) {
         sw__load_modules(ctx); 
+    }
+
+    if (ctx->reload_modules) {
+        sw__load_modules_internal(&ctx->internal, ctx->process, ctx->process_id);
+        ctx->reload_modules = false;
     }
 
     if (ctx->internal.dbg_help == NULL) {
@@ -1226,7 +1094,7 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
                                         ctx->internal.fSymFunctionTableAccess64,
                                         ctx->internal.fSymGetModuleBase64, NULL)) {
             // INFO: "StackWalk64" does not set "GetLastError"...
-            ctx->callbacks.error_msg("StackWalk64", 0, s.AddrPC.Offset, callbacks_userptr);
+            SW_LOG_ERROR("StackWalk64 failed");
             break;
         }
 
@@ -1248,7 +1116,7 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
         cs_entry.module_name[0] = 0;
         if (s.AddrPC.Offset == s.AddrReturn.Offset) {
             if ((ctx->max_recursion > 0) && (cur_recursion_count > ctx->max_recursion)) {
-                 ctx->callbacks.error_msg("StackWalk64-Endless-Callstack!", 0, s.AddrPC.Offset, callbacks_userptr);
+                SW_LOG_ERROR("StackWalk64-Endless-Callstack!");
                 break;
             }
             cur_recursion_count++;
@@ -1270,7 +1138,7 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
                         break;
                     else if (gle == ERROR_MOD_NOT_FOUND)
                         continue;
-                    ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, s.AddrPC.Offset, callbacks_userptr);
+                    SW_LOG_ERROR("SymGetSymFromAddr64 failed (ErrorCode=%lu)", gle);
                 }
             }
 
@@ -1285,14 +1153,14 @@ SW_API_IMPL bool sw_show_callstack_userptr(sw_context* ctx, sw_sys_handle thread
                         break;
                     else if (gle == ERROR_MOD_NOT_FOUND)
                         continue;
-                    ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, s.AddrPC.Offset, callbacks_userptr);
+                    SW_LOG_ERROR("SymGetLineFromAddr64 (ErrorCode=%lu)", gle);
                 }
             }    // yes, we have SymGetLineFromAddr64()
 
             // show module info (SymGetModuleInfo64())
             if (ctx->options & SW_OPTIONS_MODULEINFO) {
                 if (!sw__get_module_info_csentry(&ctx->internal, ctx->process, s.AddrPC.Offset, &cs_entry)) {    // got module info OK
-                    ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(),  s.AddrPC.Offset, callbacks_userptr);
+                    SW_LOG_ERROR("SymGetModuleInfo64 (ErrorCode=%lu)", GetLastError());
                 }
             }
         }    // s.AddrPC.Offset != 0
@@ -1319,10 +1187,6 @@ SW_API_IMPL uint16_t sw_capture_current(sw_context* ctx, void* symbols[SW_MAX_FR
 {
     SW_ASSERT(ctx);
 
-    if (!sw__load_modules(ctx)) {
-        return 0;
-    }
-
     uint32_t max_frames = ctx->frames_to_capture != 0xffffffff ? ctx->frames_to_capture : SW_MAX_FRAMES;
     max_frames = max_frames > SW_MAX_FRAMES ? SW_MAX_FRAMES : max_frames;
 
@@ -1333,11 +1197,17 @@ SW_API_IMPL uint16_t sw_capture_current(sw_context* ctx, void* symbols[SW_MAX_FR
 SW_API_IMPL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_FRAMES], 
                                           sw_callstack_entry entries[SW_MAX_FRAMES], uint16_t num_entries)
 {
+    SW_ASSERT(ctx);
     IMAGEHLP_LINE64 line;
 
     if (!sw__load_modules(ctx)) {
         return 0;
-    }    
+    }
+
+    if (ctx->reload_modules) {
+        sw__load_modules_internal(&ctx->internal, ctx->process, ctx->process_id);
+        ctx->reload_modules = false;
+    }
 
     IMAGEHLP_SYMBOL64* symbol = (IMAGEHLP_SYMBOL64*)alloca(sizeof(IMAGEHLP_SYMBOL64) + SW_MAX_NAME_LEN);
     if (!symbol) {
@@ -1360,7 +1230,7 @@ SW_API_IMPL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_
                 if (gle == ERROR_INVALID_ADDRESS || gle == ERROR_MOD_NOT_FOUND) {
                     continue;
                 }                                       
-                ctx->callbacks.error_msg("SymGetSymFromAddr64", gle, (uint64_t)symbols[i], ctx->callbacks_userptr);
+                SW_LOG_ERROR("SymGetSymFromAddr64 failed (ErrorCode=%lu)", gle);
                 break;
             }
         }
@@ -1377,15 +1247,15 @@ SW_API_IMPL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_
                 if (gle == ERROR_INVALID_ADDRESS || gle == ERROR_MOD_NOT_FOUND) {
                     continue;
                 }
-                ctx->callbacks.error_msg("SymGetLineFromAddr64", gle, (uint64_t)symbols[i], ctx->callbacks_userptr);
+                SW_LOG_ERROR("SymGetLineFromAddr64 failed (ErrorCode=%lu)", gle);
                 break;
             }
         }    // yes, we have SymGetLineFromAddr64()
 
         // show module info (SymGetModuleInfo64())
         if (ctx->options & SW_OPTIONS_MODULEINFO) {
-            if (!sw__get_module_info_csentry(&ctx->internal, ctx->process, (uint64_t)symbols[i], &entry)) {    // got module info OK
-                ctx->callbacks.error_msg("SymGetModuleInfo64", GetLastError(),  (uint64_t)symbols[i], ctx->callbacks_userptr);
+            if (!sw__get_module_info_csentry(&ctx->internal, ctx->process, (uint64_t)symbols[i], &entry)) {
+                SW_LOG_ERROR("SymGetModuleInfo64 failed (ErrorCode=%lu)", GetLastError());
             }
         }        
 
@@ -1393,6 +1263,41 @@ SW_API_IMPL uint16_t sw_resolve_callstack(sw_context* ctx, void* symbols[SW_MAX_
     }
 
     return count;
+}
+
+SW_API_IMPL void sw_reload_modules(sw_context* ctx)
+{
+    SW_ASSERT(ctx);
+    ctx->reload_modules = true;
+}
+
+SW_API_IMPL bool sw_get_symbol_module(sw_context* ctx, void* symbol, char module_name[32])
+{
+    if (!sw__load_modules(ctx)) {
+        return false;
+    }
+
+    if (ctx->reload_modules) {
+        sw__load_modules_internal(&ctx->internal, ctx->process, ctx->process_id);
+        ctx->reload_modules = false;
+    }
+
+    SW_ASSERT(ctx);
+    if (ctx->options & SW_OPTIONS_MODULEINFO) {
+        IMAGEHLP_MODULE64_V3 modinfo;
+        if (!sw__get_module_info(&ctx->internal, ctx->process, (DWORD64)symbol, &modinfo)) {   
+            SW_LOG_ERROR("SymGetModuleInfo64 failed (ErrorCode=%lu)", GetLastError());
+        } else {
+            sw__strcpy(module_name, 32, modinfo.ModuleName);
+            return true;
+        }
+    }
+    return false;    
+}
+
+SW_API_IMPL void sw_set_dbghelp_hintpath(const char* path)
+{
+    sw__strcpy(sw__dbghelp_hintpath, sizeof(sw__dbghelp_hintpath), path);
 }
 
 #endif // SW_IMPL

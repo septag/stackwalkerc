@@ -8,11 +8,9 @@ static void symbol_init(const char* search_path, uint32_t sym_opts, void* userpt
     printf("Search path: %s\n", search_path);
 }
 
-static void load_module(const char* img, const char* module, uint64_t base_addr, uint32_t size, 
-                        uint32_t result, const char* sym_type, const char* pdb_name, uint64_t file_version,
-                        void* userptr)
+static void load_module(const char* img, const char* module, uint64_t base_addr, uint32_t size, void* userptr)
 {
-    printf("Load module:\n\timage: %s\n\tmodule: %s\n\tpdb: %s\n", img, module, pdb_name);
+    printf("Load module:\n\timage: %s\n\tmodule: %s\n", img, module);
 }
 
 static void callstack_entry(const sw_callstack_entry* entry, void* userptr)
@@ -28,11 +26,6 @@ static void callstack_begin(void* userptr)
 static void callstack_end(void* userptr)
 {
     puts("EndCallstack");
-}
-
-static void error_msg(const char* filename, uint32_t gle, uint64_t addr, void* userptr)
-{
-    printf("error: %s\n", filename);
 }
 
 static sw_context* g_stackwalk;
@@ -61,7 +54,6 @@ static void foo(void)
 int main(int argc, char* argv[])
 {
     sw_callbacks callbacks;
-    callbacks.error_msg = error_msg;
     callbacks.load_module = load_module;
     callbacks.callstack_begin = callstack_begin;
     callbacks.callstack_entry = callstack_entry;
